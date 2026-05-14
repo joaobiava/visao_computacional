@@ -1,7 +1,4 @@
 import os
-os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
-os.environ["QT_SCALE_FACTOR"] = "1"
-
 import cv2
 import cv2.aruco as aruco
 import numpy as np
@@ -71,11 +68,11 @@ ID_MET_B      = 1   # metrologia marcador B
 ID_OCR_BASE   = 2   # ocarina base
 ID_HOLE_START = 3   # furos IDs 3-8
 
-MARKER_CM = 5.0     # tamanho real do marcador impresso em cm
+MARKER_CM = 3.0     # tamanho real do marcador impresso em cm
 
 # ── Utilitários ───────────────────────────────────
 def marker_center(corners):
-    c = corners[0]
+    c = corners[0][0]  # shape (4, 2)
     return int(c[:, 0].mean()), int(c[:, 1].mean())
 
 def txt(img, text, pos, scale=0.7, color=(0,255,0), thickness=2):
@@ -109,12 +106,20 @@ def mode_metrologia(cap):
         if ID_MET_A in found and ID_MET_B in found:
             ca = marker_center([found[ID_MET_A]])
             cb = marker_center([found[ID_MET_B]])
-            side_a = np.linalg.norm(found[ID_MET_A][0][0][0] - found[ID_MET_A][0][0][1])
-            side_b = np.linalg.norm(found[ID_MET_B][0][0][0] - found[ID_MET_B][0][0][1])
-            avg_side = (side_a + side_b) / 2
+
+            def marker_size_px(corners):
+                c = corners[0]
+                sides = [np.linalg.norm(c[i] - c[(i+1) % 4]) for i in range(4)]
+                return np.mean(sides)
+
+            size_a = marker_size_px(found[ID_MET_A])
+            size_b = marker_size_px(found[ID_MET_B])
+            avg_size = (size_a + size_b) / 2
+
             dist_px = math.dist(ca, cb)
-            dist = dist_px * MARKER_CM / avg_side if avg_side else 0.0
-            cv2.line(frame, ca, cb, (0, 255, 0), 2)
+            dist_px_borda = max(0, dist_px - (size_a / 2) - (size_b / 2))
+            dist = dist_px_borda * MARKER_CM / avg_size if avg_size else 0.0
+
             cv2.circle(frame, ca, 6, (0, 200, 255), -1)
             cv2.circle(frame, cb, 6, (0, 200, 255), -1)
             mp2 = ((ca[0]+cb[0])//2, (ca[1]+cb[1])//2)
@@ -124,7 +129,7 @@ def mode_metrologia(cap):
             txt(frame, label, (mp2[0]-tw//2, mp2[1]-2))
         else:
             msg = "Aponte tambem o segundo marcador" if (ID_MET_A in found or ID_MET_B in found) \
-                  else "Aponte os marcadores ID 0 e ID 1"
+                else "Aponte os marcadores ID 0 e ID 1"
             txt(frame, msg, (10, 30), color=(0, 100, 255))
 
         txt(frame, "METROLOGIA | Q=sair", (10, frame.shape[0]-10), scale=0.5, color=(180,180,180))
@@ -154,15 +159,18 @@ def mode_ocarina(cap):
             if hid in found:
                 aruco.drawDetectedMarkers(frame, [found[hid]], np.array([[hid]]))
                 cx, cy = marker_center([found[hid]])
-                txt(frame, note, (cx - 15, cy - 20), scale=0.9, color=(0, 255, 255), thickness=2)
-                nota_ativa = note
-                now = time.time()
-                if PYGAME_OK and (now - cooldown.get(hid, 0)) > COOL:
-                    SOUNDS[note].play()
-                    cooldown[hid] = now
+                txt(frame, note, (cx - 15, cy - 20), scale=0.9, color=(140, 140, 140), thickness=2)
+            else:
+                # Furo tampado = marcador sumiu = toca o som
+                if ID_OCR_BASE in found:
+                    now = time.time()
+                    if PYGAME_OK and (now - cooldown.get(hid, 0)) > COOL:
+                        SOUNDS[note].play()
+                        cooldown[hid] = now
+                    nota_ativa = note
 
-            cor = (0, 220, 100) if hid in found else (140, 140, 140)
-            sufixo = "  << tocando" if hid in found else ""
+            cor = (140, 140, 140) if hid in found else (0, 220, 100)
+            sufixo = "  << tampado" if hid not in found and ID_OCR_BASE in found else ""
             txt(frame, f"ID {hid} -> {note}{sufixo}", (10, 60 + i*26), scale=0.48, color=cor, thickness=1)
 
         status = f"Tocando: {nota_ativa}" if nota_ativa else \
