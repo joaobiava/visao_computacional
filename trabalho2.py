@@ -13,6 +13,10 @@ from mediapipe.tasks.python import vision as _mpv
 import pyrender
 import trimesh
 
+_skull_scene = None
+_skull_renderer = None
+_skull_mesh_node = None
+
 try:
     import trimesh
     import pyrender
@@ -391,13 +395,103 @@ def _draw_on_hand(frame, landmarks, w, h, angle):
     cy = int(np.mean([landmarks[i].y * h for i in palm]))
     hand_len = math.dist((landmarks[0].x*w, landmarks[0].y*h),
                          (landmarks[9].x*w, landmarks[9].y*h))
-    size = max(8, int(hand_len * 0.20))
-    _cube(frame, cx, cy - int(hand_len*0.15), size, angle)
+    # Usa hand_len diretamente como size para escala mais responsiva
+    size = max(20, int(hand_len * 0.6))
+    pos_y = cy - int(hand_len * 0.15)
+    if not _render_skull(frame, cx, pos_y, size):
+        _cube(frame, cx, pos_y, size, angle)
     cv2.circle(frame, (cx, cy), 5, (0,0,255), -1)
 
 HAND_CONN = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),
              (9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
              (13,17),(17,18),(18,19),(19,20),(0,17)]
+
+def _load_skull(w, h):
+    global _skull_scene, _skull_renderer, _skull_mesh_node
+    if not PYRENDER_OK: return
+    path = "12140_Skull_v3_L2.obj"
+    if not os.path.exists(path):
+        print("[AVISO] Skull .obj não encontrado."); return
+    try:
+        mesh = trimesh.load(path, force='mesh', process=False, skip_materials=True)
+        mesh.apply_translation(-mesh.centroid)
+        mesh.apply_scale(1.0 / mesh.extents.max())
+
+        # Testa diferentes rotações para achar a orientação certa
+        # Rotaciona 90 graus no eixo X para ficar de frente
+        rot = trimesh.transformations.rotation_matrix(-math.pi / 2, [1, 0, 0])
+        mesh.apply_transform(rot)
+
+        mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
+        mesh.visual.vertex_colors = np.array([[220, 210, 180, 255]] * len(mesh.vertices), dtype=np.uint8)
+
+        pr_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=True)
+        _skull_scene = pyrender.Scene(bg_color=[0, 0, 0, 0], ambient_light=[0.6, 0.6, 0.6])
+        _skull_mesh_node = _skull_scene.add(pr_mesh)
+        light = pyrender.DirectionalLight(color=[1,1,1], intensity=4.0)
+        _skull_scene.add(light, pose=np.eye(4))
+        # Luz de outro ângulo para dar volume
+        light2 = pyrender.DirectionalLight(color=[0.8,0.8,0.8], intensity=2.0)
+        pose2 = np.array([[1,0,0,0.5],[0,1,0,0.5],[0,0,1,1],[0,0,0,1]], dtype=np.float64)
+        _skull_scene.add(light2, pose=pose2)
+        _skull_renderer = pyrender.OffscreenRenderer(200, 200)
+        print("[OK] Caveira carregada.")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"[AVISO] Erro ao carregar caveira: {e}")
+
+def _render_skull(frame, cx, cy, size):
+    if not PYRENDER_OK or _skull_scene is None or _skull_renderer is None:
+        return False
+    try:
+        for node in list(_skull_scene.nodes):
+            if node.camera is not None:
+                _skull_scene.remove_node(node)
+
+        cam = pyrender.PerspectiveCamera(yfov=np.pi / 3)
+        # Câmera posicionada na frente do modelo
+        cam_pose = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 2],
+            [0, 0, 0, 1]], dtype=np.float64)
+        _skull_scene.add(cam, pose=cam_pose)
+
+        render_size = max(100, size * 2)
+        _skull_renderer.viewport_width  = render_size
+        _skull_renderer.viewport_height = render_size
+
+        color, _ = _skull_renderer.render(_skull_scene)
+        render_bgr = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+
+        # Fundo preto puro — remove com threshold
+        gray = cv2.cvtColor(render_bgr, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
+        # Dilata levemente para cobrir bordas
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask_inv = cv2.bitwise_not(mask)
+
+        h, w = frame.shape[:2]
+        half = render_size // 2
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(w, cx + half)
+        y2 = min(h, cy + half)
+        roi_w, roi_h = x2 - x1, y2 - y1
+        if roi_w <= 0 or roi_h <= 0: return False
+
+        patch    = cv2.resize(render_bgr, (roi_w, roi_h))
+        mask_r   = cv2.resize(mask,       (roi_w, roi_h))
+        mask_inv_r = cv2.resize(mask_inv, (roi_w, roi_h))
+
+        bg = cv2.bitwise_and(frame[y1:y2, x1:x2], frame[y1:y2, x1:x2], mask=mask_inv_r)
+        fg = cv2.bitwise_and(patch, patch, mask=mask_r)
+        frame[y1:y2, x1:x2] = cv2.add(bg, fg)
+        return True
+    except Exception as e:
+        print(f"[skull render erro] {e}")
+        return False
 
 def mode_ar_mediapipe(cap):
     if not MP_OK:
@@ -408,6 +502,9 @@ def mode_ar_mediapipe(cap):
     if _MP_API == "legacy":
         hands = mp.solutions.hands.Hands(max_num_hands=1,
             min_detection_confidence=0.7, min_tracking_confidence=0.6)
+        h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _load_skull(w0, h0)
         while True:
             ret, frame = cap.read()
             if not ret: break
@@ -444,6 +541,9 @@ def mode_ar_mediapipe(cap):
             _mpv.HandLandmarkerOptions(
                 base_options=_mpt.BaseOptions(model_asset_path=model_path),
                 running_mode=_mpv.RunningMode.IMAGE, num_hands=1))
+        h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _load_skull(w0, h0)
         while True:
             ret, frame = cap.read()
             if not ret: break
